@@ -1,7 +1,7 @@
 // app.js – 화면 동작 (목록 그리기, 일정 추가)
 
-let baseTasks = [];
-let addedTasks = [];
+let taskClient = null;
+let savingTask = false;
 let tasksReady = false;
 let tasks = [];
 let weatherByRegion = {};
@@ -43,29 +43,42 @@ async function loadTasks() {
   const status = document.getElementById('taskStatus');
   status.textContent = '일정을 불러오는 중입니다.';
   try {
-    const response = await fetch('data/tasks.json');
-    if (!response.ok) throw new Error('일정 요청 실패');
-    const data = await response.json();
+    taskClient = createTaskClient();
+    const { data, error } = await taskClient.from('wx_tasks')
+      .select('id,title,region,kind,owner').order('id', { ascending: true });
+    if (error) throw error;
     if (!Array.isArray(data) || !data.every(isTask)) throw new Error('잘못된 일정 데이터');
-    baseTasks = data;
-    status.textContent = '';
+    tasks = data;
+    tasksReady = true;
+    status.textContent = data.length ? '' : '등록된 일정이 없습니다. 새 일정을 추가해 주세요.';
   } catch (error) {
-    status.textContent = window.location.protocol === 'file:'
-      ? '배포주소로열어주세요'
-      : '기본 일정을 불러오지 못했습니다. 새로고침해 다시 시도하세요.';
+    status.textContent = '일정을 불러오지 못했습니다. config.js의 주소·공개용 키와 setup.sql 실행 여부를 확인한 뒤 새로고침해 주세요.';
   }
-
-  // JSON을 먼저 읽고, 화면에서 추가했던 일정만 브라우저 저장소에서 합친다.
-  try {
-    const saved = JSON.parse(localStorage.getItem('wx_added') || '[]');
-    if (!Array.isArray(saved) || !saved.every(isTask)) throw new Error('잘못된 저장 일정');
-    addedTasks = saved;
-  } catch (error) {
-    document.getElementById('msgBox').textContent = '브라우저에 저장된 일정을 읽을 수 없습니다.';
-  }
-  tasks = baseTasks.concat(addedTasks);
-  tasksReady = true;
   renderTasks();
+}
+
+function createTaskClient() {
+  if (typeof SUPABASE_URL !== 'string' || !SUPABASE_URL
+      || typeof SUPABASE_PUBLIC_KEY !== 'string' || !SUPABASE_PUBLIC_KEY) {
+    throw new Error('Supabase 설정 필요');
+  }
+  // 공개용 publishable 키 또는 기존 anon 키만 사용한다.
+  let publicKey = /^sb_publishable_[A-Za-z0-9_-]+$/.test(SUPABASE_PUBLIC_KEY);
+  if (!publicKey) {
+    try {
+      const payload = SUPABASE_PUBLIC_KEY.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+      publicKey = JSON.parse(atob(payload)).role === 'anon';
+    } catch (error) {
+      publicKey = false;
+    }
+  }
+  if (!publicKey || new URL(SUPABASE_URL).protocol !== 'https:') {
+    throw new Error('주소 또는 공개용 키 확인 필요');
+  }
+  if (!window.supabase?.createClient) throw new Error('supabase-js 로딩 실패');
+  return window.supabase.createClient(SUPABASE_URL, SUPABASE_PUBLIC_KEY, {
+    auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
+  });
 }
 
 function weatherText(w) {
@@ -92,11 +105,12 @@ function renderTasks() {
   }
 }
 
-function addTask(e) {
+async function addTask(e) {
   e.preventDefault();
   const message = document.getElementById('msgBox');
+  if (savingTask) return;
   if (!tasksReady) {
-    message.textContent = '일정을 불러온 뒤 추가해 주세요.';
+    message.textContent = 'Supabase 연결과 일정 로딩이 완료된 뒤 추가해 주세요.';
     return;
   }
   const t = {
@@ -105,17 +119,46 @@ function addTask(e) {
     kind: document.getElementById('kindInput').value,
     owner: document.getElementById('ownerInput').value.trim(),
   };
-  if (!t.title || !t.owner) return;
-  addedTasks.push(t);
-  message.textContent = '';
-  try {
-    localStorage.setItem('wx_added', JSON.stringify(addedTasks));
-  } catch (error) {
-    message.textContent = '일정은 추가했지만 브라우저에 저장하지 못했습니다. 새로고침하면 사라집니다.';
+  if (!isTask(t)) {
+    message.textContent = '일정·담당을 입력하고 지역과 구분을 선택해 주세요.';
+    return;
   }
-  e.target.reset();
-  tasks = baseTasks.concat(addedTasks);
-  renderTasks();
+  const form = e.target;
+  const button = document.getElementById('addTaskButton');
+  savingTask = true;
+  button.disabled = true;
+  message.textContent = '일정을 저장하는 중입니다.';
+  try {
+    const { data, error } = await taskClient.from('wx_tasks').insert(t)
+      .select('id,title,region,kind,owner').single();
+    if (error) throw error;
+    if (!isTask(data)) throw new Error('잘못된 저장 응답');
+    tasks.push(data);
+    form.reset();
+    renderTasks();
+    document.getElementById('taskStatus').textContent = '';
+    message.textContent = '일정을 Supabase에 저장했습니다.';
+  } catch (error) {
+    message.textContent = '일정 저장을 확인하지 못했습니다. 입력 내용은 유지했습니다. 새로고침해 목록을 확인한 뒤 다시 시도해 주세요.';
+  } finally {
+    savingTask = false;
+    button.disabled = false;
+  }
+}
+
+function downloadJudgment() {
+  const rows = Array.from(document.getElementById('taskList').rows,
+    (row) => Array.from(row.cells, (cell) => cell.textContent));
+  const markdown = createJudgmentMarkdown(todayText, rows, testWind);
+  const blob = new Blob([markdown], { type: 'text/markdown;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = '현장일정_판단_' + todayText + '.md';
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 const today = new Date();
@@ -129,6 +172,7 @@ todayDate.textContent = todayText;
 todayDate.dateTime = todayText;
 
 document.getElementById('taskForm').addEventListener('submit', addTask);
+document.getElementById('downloadJudgment').addEventListener('click', downloadJudgment);
 loadTasks();
 renderTasks();
 loadWeather();
